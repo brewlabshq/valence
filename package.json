@@ -1,0 +1,19 @@
+{
+  "name": "stake-pool-rebalancer",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "rebalance": "bun run src/rebalance.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@solana/spl-stake-pool": "^1.1.8",
+    "@solana/web3.js": "^1.98.4"
+  }
+}
