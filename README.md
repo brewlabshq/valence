@@ -2,6 +2,8 @@
 
 Built for **stake pool operators** who need to rebalance validator allocations across multiple pools. Manually calculating stake distributions, tracking validator changes, and generating execution commands is error-prone and time-consuming. This tool solves that by providing an interactive interface to plan rebalancing operations, validate totals, and automatically generate ready-to-run execution scripts—all while ensuring your pool's stake totals remain balanced.
 
+![image.png](image.png)
+
 ## Features
 
 - 📊 **Live Data**: Fetches current pool state directly from the Solana blockchain
