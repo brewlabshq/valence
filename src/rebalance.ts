@@ -27,6 +27,8 @@ interface EditState {
 	newValidators: ValidatorData[];
 	reserveAccount: string;
 	reserveBalance: number;
+	currentPage: number;
+	validatorsPerPage: number;
 }
 
 const DATA_FILE = 'data.json';
@@ -138,6 +140,13 @@ function printValidatorList(state: EditState) {
 		(a, b) => (a.targetBalance ?? a.activeBalance) - (b.targetBalance ?? b.activeBalance),
 	);
 
+	const totalValidators = allValidators.length;
+	const totalPages = Math.max(1, Math.ceil(totalValidators / state.validatorsPerPage));
+	const currentPage = Math.min(Math.max(1, state.currentPage), totalPages);
+	const startIdx = (currentPage - 1) * state.validatorsPerPage;
+	const endIdx = Math.min(startIdx + state.validatorsPerPage, totalValidators);
+	const pageValidators = allValidators.slice(startIdx, endIdx);
+
 	console.log(
 		colors.dim +
 			'  #    Name                   Vote Account       Current              Target             Action' +
@@ -145,7 +154,7 @@ function printValidatorList(state: EditState) {
 	);
 	console.log(colors.dim + '  ────────────────────────────────────────────────────────────────────────────────────────────────────────' + colors.reset);
 
-	for (const v of allValidators) {
+	for (const v of pageValidators) {
 		const actionColor =
 			v.action === 'remove'
 				? colors.red
@@ -175,7 +184,7 @@ function printValidatorList(state: EditState) {
 	console.log();
 	console.log(
 		colors.dim +
-			`  Total: ${allValidators.length} validators` +
+			`  Page ${currentPage}/${totalPages} (${totalValidators} validators)` +
 			colors.reset,
 	);
 }
@@ -183,6 +192,7 @@ function printValidatorList(state: EditState) {
 function printMenu() {
 	console.log();
 	console.log(colors.bold + '  Commands:' + colors.reset);
+	console.log('  [n/p]     Next/Previous page');
 	console.log('  [r #]     Remove validator by number (e.g., r 5)');
 	console.log('  [u #]     Undo remove (e.g., u 5)');
 	console.log('  [s # AMT] Set target stake (e.g., s 5 8000)');
@@ -192,6 +202,17 @@ function printMenu() {
 	console.log('  [w]       Write/Save to ' + OUTPUT_FILE);
 	console.log('  [q]       Quit');
 	console.log();
+}
+
+function normalizePage(state: EditState): void {
+	const allValidators = [
+		...state.validators,
+		...state.newValidators,
+	];
+	const totalPages = Math.max(1, Math.ceil(allValidators.length / state.validatorsPerPage));
+	if (state.currentPage > totalPages) {
+		state.currentPage = Math.max(1, totalPages);
+	}
 }
 
 // Round to lamport precision (9 decimal places)
@@ -506,6 +527,8 @@ async function main() {
 		newValidators: [],
 		reserveAccount,
 		reserveBalance,
+		currentPage: 1,
+		validatorsPerPage: 15,
 	};
 
 	while (true) {
@@ -522,12 +545,26 @@ async function main() {
 			console.log('  Goodbye!');
 			rl.close();
 			process.exit(0);
+		} else if (cmd === 'n' || cmd === 'next') {
+			const allValidators = [
+				...state.validators,
+				...state.newValidators,
+			];
+			const totalPages = Math.max(1, Math.ceil(allValidators.length / state.validatorsPerPage));
+			if (state.currentPage < totalPages) {
+				state.currentPage++;
+			}
+		} else if (cmd === 'p' || cmd === 'prev' || cmd === 'previous') {
+			if (state.currentPage > 1) {
+				state.currentPage--;
+			}
 		} else if (cmd === 'r' && parts[1]) {
 			const idx = parseInt(parts[1], 10) - 1;
 			const validator = state.validators[idx];
 			if (idx >= 0 && idx < state.validators.length && validator) {
 				validator.action = 'remove';
 				validator.targetBalance = 0;
+				normalizePage(state);
 			} else {
 				console.log(colors.red + '  Invalid validator number' + colors.reset);
 				await prompt('  Press Enter to continue...');
@@ -538,6 +575,7 @@ async function main() {
 			if (idx >= 0 && idx < state.validators.length && validator) {
 				validator.action = 'keep';
 				validator.targetBalance = validator.activeBalance;
+				normalizePage(state);
 			}
 		} else if (cmd === 's' && parts[1] && parts[2]) {
 			const idx = parseInt(parts[1], 10) - 1;
@@ -576,6 +614,7 @@ async function main() {
 					targetBalance: 0,
 					action: 'add',
 				});
+				normalizePage(state);
 				console.log(colors.green + '  Added new validator. Set stake with: s # AMOUNT' + colors.reset);
 				await prompt('  Press Enter to continue...');
 			}
