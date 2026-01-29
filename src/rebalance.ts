@@ -1,6 +1,10 @@
 import fs from 'fs';
 import readline from 'readline';
+import { PublicKey } from '@solana/web3.js';
+import { connection } from './config.ts';
 import { dumpPoolValidatorData } from './pool-fetcher.ts';
+
+const VOTE_PROGRAM_ID = new PublicKey('Vote111111111111111111111111111111111111111');
 
 interface ValidatorData {
 	voteAccount: string;
@@ -111,15 +115,57 @@ function printHeader(state: EditState) {
 			console.log(`  + ${colors.red}${shortName(v.name, 16)}${colors.reset}  ${colors.red}${formatSOL(v.activeBalance)} SOL${colors.reset}`);
 		}
 		console.log(`  = After Removals:  ${colors.green}${formatSOL(projectedReserve)} SOL${colors.reset}`);
+		// Available to allocate = After Removals − Reserve (stake from removals we can use)
+		console.log(
+			`  → Available:        ${colors.cyan}${formatSOL(removedStake)} SOL${colors.reset}  ${colors.dim}(After Removals − Reserve)${colors.reset}`,
+		);
 	}
 	console.log();
 	console.log(`  Staked Total:      ${colors.yellow}${formatSOL(totalCurrent)} SOL${colors.reset}`);
 	console.log(`  Target Staked:     ${colors.green}${formatSOL(totalWithNew)} SOL${colors.reset}`);
+	if (state.newValidators.length > 0) {
+		console.log(
+			`  New validators:     ${colors.green}${formatSOL(newValidatorStake)} SOL${colors.reset}  ${colors.dim}(${state.newValidators.length} validator${state.newValidators.length === 1 ? '' : 's'})${colors.reset}`,
+		);
+	}
 	console.log(`  Pool Total:        ${colors.cyan}${formatSOL(totalPoolStake)} SOL${colors.reset}`);
 	console.log();
 	console.log(
 		`  Validators:        ${state.validators.filter((v) => v.action !== 'remove').length + state.newValidators.length} active, ${state.validators.filter((v) => v.action === 'remove').length} to remove`,
 	);
+	console.log();
+}
+
+function printNewValidatorsPanel(state: EditState) {
+	if (state.newValidators.length === 0) return;
+
+	const total = state.newValidators.reduce(
+		(s, v) => s + (v.targetBalance ?? 0),
+		0,
+	);
+	console.log(colors.cyan + '  ┌─ New validators ─────────────────────────────────────────────────────────────────' + colors.reset);
+	console.log(
+		colors.dim +
+			'  │  #    Name                   Vote Account            Target' +
+			colors.reset,
+	);
+	console.log(colors.dim + '  ├──────────────────────────────────────────────────────────────────────────────────────' + colors.reset);
+
+	for (let i = 0; i < state.newValidators.length; i++) {
+		const v = state.newValidators[i];
+		if (v === undefined) continue;
+		const idx = state.validators.length + i + 1;
+		const target = v.targetBalance ?? 0;
+		console.log(
+			`  │  ${String(idx).padStart(2)}   ${shortName(v.name, 20)}  ${shortAddress(v.voteAccount).padEnd(18)}  ${colors.green}${formatSOL(target)} SOL${colors.reset}`,
+		);
+	}
+
+	console.log(colors.dim + '  ├──────────────────────────────────────────────────────────────────────────────────────' + colors.reset);
+	console.log(
+		`  │  Total: ${colors.green}${formatSOL(total)} SOL${colors.reset}  ${colors.dim}(${state.newValidators.length} validator${state.newValidators.length === 1 ? '' : 's'})${colors.reset}`,
+	);
+	console.log(colors.cyan + '  └──────────────────────────────────────────────────────────────────────────────────────' + colors.reset);
 	console.log();
 }
 
@@ -178,6 +224,16 @@ function printValidatorList(state: EditState) {
 			`  Total: ${allValidators.length} validators` +
 			colors.reset,
 	);
+	if (state.newValidators.length > 0) {
+		const newTotal = state.newValidators.reduce(
+			(s, v) => s + (v.targetBalance ?? 0),
+			0,
+		);
+		console.log(
+			colors.dim +
+				`  New validators total: ${colors.green}${formatSOL(newTotal)} SOL${colors.reset} ${colors.dim}(${state.newValidators.length} validator${state.newValidators.length === 1 ? '' : 's'})${colors.reset}`,
+		);
+	}
 }
 
 function printMenu() {
@@ -198,6 +254,59 @@ function printMenu() {
 // Round to lamport precision (9 decimal places)
 function roundToLamports(sol: number): number {
 	return Math.round(sol * 1_000_000_000) / 1_000_000_000;
+}
+
+const SYSTEM_PROGRAM_ID = new PublicKey('11111111111111111111111111111111');
+
+/** Validate address as vote account or validator identity; resolve to vote account if needed. */
+async function validateVoteAccount(
+	input: string,
+): Promise<{ valid: boolean; voteAccount: string; error?: string }> {
+	try {
+		const pubkey = new PublicKey(input);
+		const { current, delinquent } = await connection.getVoteAccounts();
+		const all = [...current, ...delinquent];
+		const byVote = all.find((a) => a.votePubkey === input);
+		const byNode = all.find((a) => a.nodePubkey === input);
+
+		if (byVote) {
+			return { valid: true, voteAccount: input };
+		}
+		if (byNode) {
+			return { valid: true, voteAccount: byNode.votePubkey };
+		}
+
+		// Not in vote accounts list – check chain
+		const info = await connection.getAccountInfo(pubkey);
+		if (!info) {
+			return { valid: false, voteAccount: input, error: 'Account not found on chain' };
+		}
+		if (info.owner.equals(VOTE_PROGRAM_ID)) {
+			return {
+				valid: false,
+				voteAccount: input,
+				error: 'Vote account not in active validator set (closed or inactive)',
+			};
+		}
+		if (info.owner.equals(SYSTEM_PROGRAM_ID)) {
+			return {
+				valid: false,
+				voteAccount: input,
+				error: 'Address is a validator identity but not in active set. Use the vote account address instead.',
+			};
+		}
+		return {
+			valid: false,
+			voteAccount: input,
+			error: `Not a vote account (owner: ${info.owner.toBase58()})`,
+		};
+	} catch (err: unknown) {
+		const msg = err instanceof Error ? err.message : String(err);
+		if (msg.includes('invalid') || msg.includes('decode')) {
+			return { valid: false, voteAccount: input, error: 'Invalid address (bad base58 or length)' };
+		}
+		return { valid: false, voteAccount: input, error: msg };
+	}
 }
 
 function autoRebalance(state: EditState): EditState {
@@ -578,6 +687,7 @@ async function main() {
 	while (true) {
 		clearScreen();
 		printHeader(state);
+		printNewValidatorsPanel(state);
 		printValidatorList(state);
 		printMenu();
 
@@ -658,19 +768,42 @@ async function main() {
 				console.log(colors.red + '  Validator already exists!' + colors.reset);
 				await prompt('  Press Enter to continue...');
 			} else {
-				state.newValidators.push({
-					voteAccount,
-					stakeAccount: '',
-					activeBalance: 0,
-					activeBalanceLamports: '0',
-					transientStakeAccount: '',
-					transientBalance: 0,
-					transientBalanceLamports: '0',
-					targetBalance: 0,
-					action: 'add',
-				});
-				console.log(colors.green + '  Added new validator. Set stake with: s # AMOUNT' + colors.reset);
-				await prompt('  Press Enter to continue...');
+				console.log(colors.dim + '  Validating vote account on chain...' + colors.reset);
+				const result = await validateVoteAccount(voteAccount);
+				if (!result.valid) {
+					console.log(colors.red + `  Invalid: ${result.error}` + colors.reset);
+					await prompt('  Press Enter to continue...');
+				} else {
+					const toAdd = result.voteAccount;
+					const alreadyExists =
+						state.validators.some((v) => v.voteAccount === toAdd) ||
+						state.newValidators.some((v) => v.voteAccount === toAdd);
+					if (alreadyExists) {
+						console.log(colors.red + '  That vote account is already in the pool.' + colors.reset);
+						await prompt('  Press Enter to continue...');
+					} else {
+						const resolvedNote =
+							toAdd !== voteAccount
+								? colors.dim + `  (resolved from validator identity to vote account ${shortAddress(toAdd)})` + colors.reset + '\n  '
+								: '';
+						state.newValidators.push({
+							voteAccount: toAdd,
+						stakeAccount: '',
+						activeBalance: 0,
+						activeBalanceLamports: '0',
+						transientStakeAccount: '',
+						transientBalance: 0,
+						transientBalanceLamports: '0',
+						targetBalance: 0,
+						action: 'add',
+					});
+						console.log(
+							colors.green + '  Valid vote account. Added. Set stake with: s # AMOUNT' + colors.reset,
+						);
+						if (resolvedNote) console.log(resolvedNote);
+						await prompt('  Press Enter to continue...');
+					}
+				}
 			}
 		} else if (cmd === 'b') {
 			state = autoRebalance(state);
