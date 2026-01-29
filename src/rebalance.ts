@@ -27,8 +27,6 @@ interface EditState {
 	newValidators: ValidatorData[];
 	reserveAccount: string;
 	reserveBalance: number;
-	currentPage: number;
-	validatorsPerPage: number;
 }
 
 const DATA_FILE = 'data.json';
@@ -104,7 +102,7 @@ function printHeader(state: EditState) {
 	const totalPoolStake = totalCurrent + state.reserveBalance;
 
 	console.log(colors.bold + '════════════════════════════════════════════════════════════════════════════════════════════════════════' + colors.reset);
-	console.log(colors.cyan + '                                    Stake Pool Rebalance TUI                                          ' + colors.reset);
+	console.log(colors.cyan + '                                    DynoSOL Pool Rebalance TUI                                          ' + colors.reset);
 	console.log(colors.bold + '════════════════════════════════════════════════════════════════════════════════════════════════════════' + colors.reset);
 	console.log();
 	console.log(`  Reserve Balance:   ${colors.blue}${formatSOL(state.reserveBalance)} SOL${colors.reset}  ${colors.dim}(${shortAddress(state.reserveAccount)})${colors.reset}`);
@@ -140,13 +138,6 @@ function printValidatorList(state: EditState) {
 		(a, b) => (a.targetBalance ?? a.activeBalance) - (b.targetBalance ?? b.activeBalance),
 	);
 
-	const totalValidators = allValidators.length;
-	const totalPages = Math.max(1, Math.ceil(totalValidators / state.validatorsPerPage));
-	const currentPage = Math.min(Math.max(1, state.currentPage), totalPages);
-	const startIdx = (currentPage - 1) * state.validatorsPerPage;
-	const endIdx = Math.min(startIdx + state.validatorsPerPage, totalValidators);
-	const pageValidators = allValidators.slice(startIdx, endIdx);
-
 	console.log(
 		colors.dim +
 			'  #    Name                   Vote Account       Current              Target             Action' +
@@ -154,7 +145,7 @@ function printValidatorList(state: EditState) {
 	);
 	console.log(colors.dim + '  ────────────────────────────────────────────────────────────────────────────────────────────────────────' + colors.reset);
 
-	for (const v of pageValidators) {
+	for (const v of allValidators) {
 		const actionColor =
 			v.action === 'remove'
 				? colors.red
@@ -184,7 +175,7 @@ function printValidatorList(state: EditState) {
 	console.log();
 	console.log(
 		colors.dim +
-			`  Page ${currentPage}/${totalPages} (${totalValidators} validators)` +
+			`  Total: ${allValidators.length} validators` +
 			colors.reset,
 	);
 }
@@ -192,27 +183,16 @@ function printValidatorList(state: EditState) {
 function printMenu() {
 	console.log();
 	console.log(colors.bold + '  Commands:' + colors.reset);
-	console.log('  [n/p]     Next/Previous page');
 	console.log('  [r #]     Remove validator by number (e.g., r 5)');
 	console.log('  [u #]     Undo remove (e.g., u 5)');
-	console.log('  [s # AMT] Set target stake (e.g., s 5 8000)');
+	console.log('  [s # AMT] Set target stake to AMT (e.g., s 5 8000)');
+	console.log('  [+ # AMT] Add AMT to validator (target = current + AMT, e.g., + 4 26135)');
 	console.log('  [a VOTE]  Add new validator');
 	console.log('  [b]       Auto-rebalance (redistribute from removed to lowest)');
 	console.log('  [v]       Validate totals');
 	console.log('  [w]       Write/Save to ' + OUTPUT_FILE);
 	console.log('  [q]       Quit');
 	console.log();
-}
-
-function normalizePage(state: EditState): void {
-	const allValidators = [
-		...state.validators,
-		...state.newValidators,
-	];
-	const totalPages = Math.max(1, Math.ceil(allValidators.length / state.validatorsPerPage));
-	if (state.currentPage > totalPages) {
-		state.currentPage = Math.max(1, totalPages);
-	}
 }
 
 // Round to lamport precision (9 decimal places)
@@ -283,6 +263,9 @@ function autoRebalance(state: EditState): EditState {
 
 function validate(state: EditState): boolean {
 	const totalCurrent = state.validators.reduce((s, v) => s + v.activeBalance, 0);
+	const removedStake = state.validators
+		.filter((v) => v.action === 'remove')
+		.reduce((s, v) => s + v.activeBalance, 0);
 	const totalTarget = state.validators
 		.filter((v) => v.action !== 'remove')
 		.reduce((s, v) => s + (v.targetBalance ?? v.activeBalance), 0);
@@ -291,16 +274,20 @@ function validate(state: EditState): boolean {
 		0,
 	);
 	const totalWithNew = totalTarget + newValidatorStake;
+	// Valid range: from remove-only (stake to reserve) to full redistribute (stake stays on validators)
+	const minStaked = totalCurrent - removedStake;
+	const maxStaked = totalCurrent;
+	const withinRange =
+		totalWithNew >= minStaked - 0.01 && totalWithNew <= maxStaked + 0.01;
 
-	const diff = Math.abs(totalWithNew - totalCurrent);
-
-	if (diff < 0.01) {
+	if (withinRange) {
 		console.log(colors.green + '  ✓ Validation PASSED! Totals match.' + colors.reset);
 		return true;
 	} else {
+		const nearest = totalWithNew < minStaked ? minStaked : maxStaked;
 		console.log(
 			colors.red +
-				`  ✗ Validation FAILED! Difference: ${formatSOL(totalWithNew - totalCurrent)} SOL` +
+				`  ✗ Validation FAILED! Difference: ${formatSOL(totalWithNew - nearest)} SOL (target must be between ${formatSOL(minStaked)} and ${formatSOL(maxStaked)} SOL)` +
 				colors.reset,
 		);
 		return false;
@@ -382,9 +369,9 @@ function generateBashScripts(state: EditState, output: any) {
 		});
 	}
 
-	// Collect all increase operations (modifications with positive change)
+	// Collect all increase operations (modifications with positive change + new validators with target stake)
 	const increaseOps: Array<{ voteAccount: string; amount: number; name?: string }> = [];
-	for (const mod of output.modifications) {
+	for (const mod of output.modifications ?? []) {
 		if (mod.change > 0) {
 			const validator = state.validators.find((v) => v.voteAccount === mod.voteAccount);
 			increaseOps.push({
@@ -394,60 +381,59 @@ function generateBashScripts(state: EditState, output: any) {
 			});
 		}
 	}
+	for (const add of output.additions ?? []) {
+		const amount = add.targetBalance ?? 0;
+		if (amount > 0) {
+			const newV = state.newValidators.find((v) => v.voteAccount === add.voteAccount);
+			increaseOps.push({
+				voteAccount: add.voteAccount,
+				amount,
+				name: newV?.name,
+			});
+		}
+	}
 
-	// Script 1: Decrease stake and remove validators
-	// Minimum stake required (1 SOL + rent exemption ~0.00228288)
-	const MIN_STAKE = 1.00228288;
-
+	// Script 1: Remove validators from pool (stake is withdrawn automatically)
 	if (removeOps.length > 0) {
 		let script1 = '#!/bin/bash\n\n';
-		script1 += '# Script 1: Decrease stake and remove validators from pool\n';
+		script1 += '# Script 1: Remove validators from pool\n';
 		script1 += `# Generated: ${new Date().toISOString()}\n`;
 		script1 += `# Pool: ${POOL_ADDRESS}\n`;
 		script1 += `# Validators to remove: ${removeOps.length}\n`;
 		script1 += '#\n';
-		script1 += '# Usage: bash 01_decrease_and_remove.sh /path/to/keypair.json [rpc_url]\n\n';
+		script1 += '# Usage: bash 01_remove_validators.sh /path/to/manager_keypair.json [rpc_url] [staker_keypair.json]\n';
+		script1 += '# If staker_keypair is omitted, manager keypair is used as staker.\n\n';
 		script1 += 'set -e\n\n';
 		script1 += 'KEYPAIR="$1"\n';
-		script1 += 'RPC_URL="${2:-https://api.mainnet-beta.solana.com}"\n\n';
+		script1 += 'RPC_URL="${2:-https://api.mainnet-beta.solana.com}"\n';
+		script1 += 'STAKER_KEYPAIR="${3:-$KEYPAIR}"\n\n';
 		script1 += 'if [ -z "$KEYPAIR" ]; then\n';
-		script1 += '    echo "Usage: bash $0 /path/to/keypair.json [rpc_url]"\n';
+		script1 += '    echo "Usage: bash $0 /path/to/keypair.json [rpc_url] [staker_keypair.json]"\n';
 		script1 += '    exit 1\n';
 		script1 += 'fi\n\n';
-		script1 += 'echo "Using keypair: $KEYPAIR"\n';
+		script1 += 'echo "Using keypair (manager): $KEYPAIR"\n';
 		script1 += 'echo "Using RPC: $RPC_URL"\n';
+		script1 += 'echo "Using staker keypair: $STAKER_KEYPAIR"\n';
 		script1 += 'echo ""\n\n';
 
 		for (const op of removeOps) {
 			const nameComment = op.name ? op.name : 'Unknown';
 			const cleanAmount = toCleanSOL(op.amount);
-			// Calculate amount to decrease (leave minimum for rent exemption)
-			const decreaseAmount = Math.max(0, op.amount - MIN_STAKE);
-			const cleanDecreaseAmount = toCleanSOL(decreaseAmount);
 
 			script1 += `echo "Removing validator: ${nameComment}"\n`;
 			script1 += `echo "Vote Account: ${op.voteAccount}"\n`;
-			script1 += `echo "Current Balance: ${cleanAmount} SOL"\n`;
-			script1 += `echo "Decreasing by: ${cleanDecreaseAmount} SOL"\n\n`;
+			script1 += `echo "Current Balance: ${cleanAmount} SOL"\n\n`;
 
-			// Decrease stake to minimum (leave 1 SOL + rent exemption)
-			if (decreaseAmount > 0) {
-				script1 += `spl-stake-pool decrease-validator-stake ${POOL_ADDRESS} ${op.voteAccount} ${cleanDecreaseAmount} \\\n`;
-				script1 += `    --url "$RPC_URL" \\\n`;
-				script1 += `    --manager "$KEYPAIR" \\\n`;
-				script1 += `    --fee-payer "$KEYPAIR"\n\n`;
-			}
-
-			// Remove validator from pool
 			script1 += `spl-stake-pool remove-validator ${POOL_ADDRESS} ${op.voteAccount} \\\n`;
 			script1 += `    --url "$RPC_URL" \\\n`;
 			script1 += `    --manager "$KEYPAIR" \\\n`;
-			script1 += `    --fee-payer "$KEYPAIR"\n\n`;
+			script1 += `    --fee-payer "$KEYPAIR" \\\n`;
+			script1 += `    --staker "$STAKER_KEYPAIR"\n\n`;
 
 			script1 += `echo "----------------------------------------"\n\n`;
 		}
 
-		const file1 = `${folderName}/01_decrease_and_remove.sh`;
+		const file1 = `${folderName}/01_remove_validators.sh`;
 		fs.writeFileSync(file1, script1, 'utf8');
 		fs.chmodSync(file1, '755');
 		console.log(colors.green + `  ✓ Generated ${file1} (${removeOps.length} validators)` + colors.reset);
@@ -455,45 +441,105 @@ function generateBashScripts(state: EditState, output: any) {
 		console.log(colors.dim + '  No validators to remove' + colors.reset);
 	}
 
-	// Script 2: Increase stake to validators
-	if (increaseOps.length > 0) {
+	// Script 2: Add new validators to pool (run before increase-stake so new validators get stake)
+	const addValidatorOps = (output.additions ?? []).map((add: any) => {
+		const newV = state.newValidators.find((v) => v.voteAccount === add.voteAccount);
+		return {
+			voteAccount: add.voteAccount,
+			amount: add.targetBalance ?? 0,
+			name: newV?.name,
+		};
+	});
+	if (addValidatorOps.length > 0) {
 		let script2 = '#!/bin/bash\n\n';
-		script2 += '# Script 2: Increase stake to validators (redistribute removed stake)\n';
+		script2 += '# Script 2: Add new validators to pool\n';
 		script2 += `# Generated: ${new Date().toISOString()}\n`;
 		script2 += `# Pool: ${POOL_ADDRESS}\n`;
-		script2 += `# Validators to increase: ${increaseOps.length}\n`;
+		script2 += `# Validators to add: ${addValidatorOps.length}\n`;
 		script2 += '#\n';
-		script2 += '# Usage: bash 02_increase_stake.sh /path/to/keypair.json [rpc_url]\n\n';
+		script2 += '# Usage: bash 02_add_validators.sh /path/to/manager_keypair.json [rpc_url] [staker_keypair.json]\n';
+		script2 += '# If staker_keypair is omitted, manager keypair is used as staker.\n';
+		script2 += '# Run 03_increase_stake.sh after this to allocate stake to new validators.\n\n';
 		script2 += 'set -e\n\n';
 		script2 += 'KEYPAIR="$1"\n';
-		script2 += 'RPC_URL="${2:-https://api.mainnet-beta.solana.com}"\n\n';
+		script2 += 'RPC_URL="${2:-https://api.mainnet-beta.solana.com}"\n';
+		script2 += 'STAKER_KEYPAIR="${3:-$KEYPAIR}"\n\n';
 		script2 += 'if [ -z "$KEYPAIR" ]; then\n';
-		script2 += '    echo "Usage: bash $0 /path/to/keypair.json [rpc_url]"\n';
+		script2 += '    echo "Usage: bash $0 /path/to/keypair.json [rpc_url] [staker_keypair.json]"\n';
 		script2 += '    exit 1\n';
 		script2 += 'fi\n\n';
-		script2 += 'echo "Using keypair: $KEYPAIR"\n';
+		script2 += 'echo "Using keypair (manager): $KEYPAIR"\n';
 		script2 += 'echo "Using RPC: $RPC_URL"\n';
+		script2 += 'echo "Using staker keypair: $STAKER_KEYPAIR"\n';
 		script2 += 'echo ""\n\n';
 
-		for (const op of increaseOps) {
+		for (const op of addValidatorOps) {
 			const nameComment = op.name ? op.name : 'Unknown';
 			const cleanAmount = toCleanSOL(op.amount);
-			script2 += `echo "Increasing stake for: ${nameComment}"\n`;
+			script2 += `echo "Adding validator: ${nameComment}"\n`;
 			script2 += `echo "Vote Account: ${op.voteAccount}"\n`;
-			script2 += `echo "Amount to add: ${cleanAmount} SOL"\n\n`;
+			script2 += `echo "Target stake (set in 03): ${cleanAmount} SOL"\n\n`;
 
-			script2 += `spl-stake-pool increase-validator-stake ${POOL_ADDRESS} ${op.voteAccount} ${cleanAmount} \\\n`;
+			script2 += `spl-stake-pool add-validator ${POOL_ADDRESS} ${op.voteAccount} \\\n`;
 			script2 += `    --url "$RPC_URL" \\\n`;
 			script2 += `    --manager "$KEYPAIR" \\\n`;
-			script2 += `    --fee-payer "$KEYPAIR"\n\n`;
+			script2 += `    --fee-payer "$KEYPAIR" \\\n`;
+			script2 += `    --staker "$STAKER_KEYPAIR"\n\n`;
 
 			script2 += `echo "----------------------------------------"\n\n`;
 		}
 
-		const file2 = `${folderName}/02_increase_stake.sh`;
+		const file2 = `${folderName}/02_add_validators.sh`;
 		fs.writeFileSync(file2, script2, 'utf8');
 		fs.chmodSync(file2, '755');
-		console.log(colors.green + `  ✓ Generated ${file2} (${increaseOps.length} validators)` + colors.reset);
+		console.log(colors.green + `  ✓ Generated ${file2} (${addValidatorOps.length} validators)` + colors.reset);
+	} else {
+		console.log(colors.dim + '  No new validators to add' + colors.reset);
+	}
+
+	// Script 3: Increase stake to validators (existing + new)
+	if (increaseOps.length > 0) {
+		let script3 = '#!/bin/bash\n\n';
+		script3 += '# Script 3: Increase stake to validators (redistribute removed stake + new validator stake)\n';
+		script3 += `# Generated: ${new Date().toISOString()}\n`;
+		script3 += `# Pool: ${POOL_ADDRESS}\n`;
+		script3 += `# Validators to increase: ${increaseOps.length}\n`;
+		script3 += '#\n';
+		script3 += '# Usage: bash 03_increase_stake.sh /path/to/manager_keypair.json [rpc_url] [staker_keypair.json]\n';
+		script3 += '# If staker_keypair is omitted, manager keypair is used as staker.\n\n';
+		script3 += 'set -e\n\n';
+		script3 += 'KEYPAIR="$1"\n';
+		script3 += 'RPC_URL="${2:-https://api.mainnet-beta.solana.com}"\n';
+		script3 += 'STAKER_KEYPAIR="${3:-$KEYPAIR}"\n\n';
+		script3 += 'if [ -z "$KEYPAIR" ]; then\n';
+		script3 += '    echo "Usage: bash $0 /path/to/keypair.json [rpc_url] [staker_keypair.json]"\n';
+		script3 += '    exit 1\n';
+		script3 += 'fi\n\n';
+		script3 += 'echo "Using keypair (manager): $KEYPAIR"\n';
+		script3 += 'echo "Using RPC: $RPC_URL"\n';
+		script3 += 'echo "Using staker keypair: $STAKER_KEYPAIR"\n';
+		script3 += 'echo ""\n\n';
+
+		for (const op of increaseOps) {
+			const nameComment = op.name ? op.name : 'Unknown';
+			const cleanAmount = toCleanSOL(op.amount);
+			script3 += `echo "Increasing stake for: ${nameComment}"\n`;
+			script3 += `echo "Vote Account: ${op.voteAccount}"\n`;
+			script3 += `echo "Amount to add: ${cleanAmount} SOL"\n\n`;
+
+			script3 += `spl-stake-pool increase-validator-stake ${POOL_ADDRESS} ${op.voteAccount} ${cleanAmount} \\\n`;
+			script3 += `    --url "$RPC_URL" \\\n`;
+			script3 += `    --manager "$KEYPAIR" \\\n`;
+			script3 += `    --fee-payer "$KEYPAIR" \\\n`;
+			script3 += `    --staker "$STAKER_KEYPAIR"\n\n`;
+
+			script3 += `echo "----------------------------------------"\n\n`;
+		}
+
+		const file3 = `${folderName}/03_increase_stake.sh`;
+		fs.writeFileSync(file3, script3, 'utf8');
+		fs.chmodSync(file3, '755');
+		console.log(colors.green + `  ✓ Generated ${file3} (${increaseOps.length} validators)` + colors.reset);
 	} else {
 		console.log(colors.dim + '  No increase operations needed' + colors.reset);
 	}
@@ -527,8 +573,6 @@ async function main() {
 		newValidators: [],
 		reserveAccount,
 		reserveBalance,
-		currentPage: 1,
-		validatorsPerPage: 15,
 	};
 
 	while (true) {
@@ -545,53 +589,64 @@ async function main() {
 			console.log('  Goodbye!');
 			rl.close();
 			process.exit(0);
-		} else if (cmd === 'n' || cmd === 'next') {
-			const allValidators = [
-				...state.validators,
-				...state.newValidators,
-			];
-			const totalPages = Math.max(1, Math.ceil(allValidators.length / state.validatorsPerPage));
-			if (state.currentPage < totalPages) {
-				state.currentPage++;
-			}
-		} else if (cmd === 'p' || cmd === 'prev' || cmd === 'previous') {
-			if (state.currentPage > 1) {
-				state.currentPage--;
-			}
 		} else if (cmd === 'r' && parts[1]) {
 			const idx = parseInt(parts[1], 10) - 1;
-			const validator = state.validators[idx];
-			if (idx >= 0 && idx < state.validators.length && validator) {
-				validator.action = 'remove';
-				validator.targetBalance = 0;
-				normalizePage(state);
+			const v = state.validators[idx];
+			if (v !== undefined && idx >= 0) {
+				v.action = 'remove';
+				v.targetBalance = 0;
 			} else {
 				console.log(colors.red + '  Invalid validator number' + colors.reset);
 				await prompt('  Press Enter to continue...');
 			}
 		} else if (cmd === 'u' && parts[1]) {
 			const idx = parseInt(parts[1], 10) - 1;
-			const validator = state.validators[idx];
-			if (idx >= 0 && idx < state.validators.length && validator) {
-				validator.action = 'keep';
-				validator.targetBalance = validator.activeBalance;
-				normalizePage(state);
+			const v = state.validators[idx];
+			if (v !== undefined && idx >= 0) {
+				v.action = 'keep';
+				v.targetBalance = v.activeBalance;
 			}
 		} else if (cmd === 's' && parts[1] && parts[2]) {
 			const idx = parseInt(parts[1], 10) - 1;
 			const amount = parseFloat(parts[2]);
-			const validator = state.validators[idx];
-			if (idx >= 0 && idx < state.validators.length && !isNaN(amount) && validator) {
-				validator.targetBalance = amount;
+			const v = state.validators[idx];
+			if (v !== undefined && idx >= 0 && !isNaN(amount)) {
+				v.targetBalance = amount;
 			} else if (
 				idx >= state.validators.length &&
-				idx < state.validators.length + state.newValidators.length
+				idx < state.validators.length + state.newValidators.length &&
+				!isNaN(amount)
 			) {
 				const newIdx = idx - state.validators.length;
-				const newValidator = state.newValidators[newIdx];
-				if (newValidator) {
-					newValidator.targetBalance = amount;
+				const nv = state.newValidators[newIdx];
+				if (nv !== undefined) nv.targetBalance = amount;
+			}
+		} else if ((cmd === '+' || cmd === 'add') && parts[1] && parts[2]) {
+			const idx = parseInt(parts[1], 10) - 1;
+			const addAmount = parseFloat(parts[2]);
+			const v = state.validators[idx];
+			if (v !== undefined && idx >= 0 && !isNaN(addAmount)) {
+				if (v.action === 'remove') {
+					console.log(colors.red + '  Cannot add to a validator marked for removal. Undo with u # first.' + colors.reset);
+					await prompt('  Press Enter to continue...');
+				} else {
+					const current = v.targetBalance ?? v.activeBalance;
+					v.targetBalance = roundToLamports(current + addAmount);
 				}
+			} else if (
+				idx >= state.validators.length &&
+				idx < state.validators.length + state.newValidators.length &&
+				!isNaN(addAmount)
+			) {
+				const newIdx = idx - state.validators.length;
+				const nv = state.newValidators[newIdx];
+				if (nv !== undefined) {
+					const current = nv.targetBalance ?? 0;
+					nv.targetBalance = roundToLamports(current + addAmount);
+				}
+			} else {
+				console.log(colors.red + '  Invalid validator number or amount' + colors.reset);
+				await prompt('  Press Enter to continue...');
 			}
 		} else if (cmd === 'a' && parts[1]) {
 			const voteAccount = parts[1];
@@ -614,7 +669,6 @@ async function main() {
 					targetBalance: 0,
 					action: 'add',
 				});
-				normalizePage(state);
 				console.log(colors.green + '  Added new validator. Set stake with: s # AMOUNT' + colors.reset);
 				await prompt('  Press Enter to continue...');
 			}
