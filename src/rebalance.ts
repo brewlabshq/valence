@@ -383,9 +383,9 @@ function validate(state: EditState): boolean {
 		0,
 	);
 	const totalWithNew = totalTarget + newValidatorStake;
-	// Valid range: from remove-only (stake to reserve) to full redistribute (stake stays on validators)
+	// Valid range: min = current minus removals (stake to reserve); max = current + reserve (can use reserve for new validators)
 	const minStaked = totalCurrent - removedStake;
-	const maxStaked = totalCurrent;
+	const maxStaked = totalCurrent + state.reserveBalance;
 	const withinRange =
 		totalWithNew >= minStaked - 0.01 && totalWithNew <= maxStaked + 0.01;
 
@@ -393,10 +393,15 @@ function validate(state: EditState): boolean {
 		console.log(colors.green + '  ✓ Validation PASSED! Totals match.' + colors.reset);
 		return true;
 	} else {
-		const nearest = totalWithNew < minStaked ? minStaked : maxStaked;
+		const nearest = totalWithNew < minStaked ? minStaked : totalWithNew > maxStaked ? maxStaked : totalWithNew;
+		const diff = totalWithNew - nearest;
+		const rangeMsg =
+			diff > 0
+				? `target staked too high (max ${formatSOL(maxStaked)} SOL = current staked + reserve)`
+				: `target must be between ${formatSOL(minStaked)} and ${formatSOL(maxStaked)} SOL`;
 		console.log(
 			colors.red +
-				`  ✗ Validation FAILED! Difference: ${formatSOL(totalWithNew - nearest)} SOL (target must be between ${formatSOL(minStaked)} and ${formatSOL(maxStaked)} SOL)` +
+				`  ✗ Validation FAILED! Difference: ${formatSOL(diff)} SOL (${rangeMsg})` +
 				colors.reset,
 		);
 		return false;
@@ -461,11 +466,9 @@ function toCleanSOL(sol: number): string {
 
 function generateBashScripts(state: EditState, output: any) {
 	const date = new Date().toISOString().split('T')[0];
-	const folderName = `rebalance_${date}`;
+	const folderName = `rebalance/${date}`;
 
-	if (!fs.existsSync(folderName)) {
-		fs.mkdirSync(folderName);
-	}
+	fs.mkdirSync(folderName, { recursive: true });
 
 	// Collect validators to fully remove
 	const removeOps: Array<{ voteAccount: string; amount: number; name?: string }> = [];
