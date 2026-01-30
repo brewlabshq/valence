@@ -1,6 +1,9 @@
 # dependencies (bun install)
 node_modules
 
+# rebalance scripts
+rebalance
+
 # output
 out
 dist
