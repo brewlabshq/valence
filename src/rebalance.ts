@@ -2,7 +2,7 @@ import fs from 'fs';
 import readline from 'readline';
 import { PublicKey } from '@solana/web3.js';
 import { connection } from './config.ts';
-import { dumpPoolValidatorData } from './pool-fetcher.ts';
+import { dumpPoolValidatorData, fetchValidatorName } from './pool-fetcher.ts';
 
 const VOTE_PROGRAM_ID = new PublicKey('Vote111111111111111111111111111111111111111');
 
@@ -101,38 +101,66 @@ function printHeader(state: EditState) {
 	// Calculate removed stake (goes back to reserve)
 	const removedValidators = state.validators.filter((v) => v.action === 'remove');
 	const removedStake = removedValidators.reduce((s, v) => s + v.activeBalance, 0);
-	const projectedReserve = state.reserveBalance + removedStake;
 
-	const totalPoolStake = totalCurrent + state.reserveBalance;
+	// Calculate transient (pending) stake across all validators
+	const totalTransient = state.validators.reduce((s, v) => s + (v.transientBalance ?? 0), 0);
+	const validatorsWithTransient = state.validators.filter((v) => (v.transientBalance ?? 0) > 0).length;
+
+	// Reserve calculations
+	const availableReserve = state.reserveBalance + removedStake;
+	const allocatedToNew = newValidatorStake;
+	const remainingReserve = availableReserve - allocatedToNew;
+
+	const totalPoolStake = totalCurrent + state.reserveBalance + totalTransient;
 
 	console.log(colors.bold + '════════════════════════════════════════════════════════════════════════════════════════════════════════' + colors.reset);
 	console.log(colors.cyan + '                                    DynoSOL Pool Rebalance TUI                                          ' + colors.reset);
 	console.log(colors.bold + '════════════════════════════════════════════════════════════════════════════════════════════════════════' + colors.reset);
 	console.log();
-	console.log(`  Reserve Balance:   ${colors.blue}${formatSOL(state.reserveBalance)} SOL${colors.reset}  ${colors.dim}(${shortAddress(state.reserveAccount)})${colors.reset}`);
+
+	// ─── RESERVE & LIQUIDITY ────────────────────────────────────────────────────
+	console.log(colors.bold + '  ┌─ Reserve & Liquidity ────────────────────────────────────────────────────────' + colors.reset);
+	console.log(`  │  Current Reserve:     ${colors.blue}${formatSOL(state.reserveBalance).padStart(22)} SOL${colors.reset}`);
 	if (removedStake > 0) {
-		for (const v of removedValidators) {
-			console.log(`  + ${colors.red}${shortName(v.name, 16)}${colors.reset}  ${colors.red}${formatSOL(v.activeBalance)} SOL${colors.reset}`);
-		}
-		console.log(`  = After Removals:  ${colors.green}${formatSOL(projectedReserve)} SOL${colors.reset}`);
-		// Available to allocate = After Removals − Reserve (stake from removals we can use)
-		console.log(
-			`  → Available:        ${colors.cyan}${formatSOL(removedStake)} SOL${colors.reset}  ${colors.dim}(After Removals − Reserve)${colors.reset}`,
-		);
+		console.log(`  │  + From Removals:     ${colors.green}${formatSOL(removedStake).padStart(22)} SOL${colors.reset}  ${colors.dim}(${removedValidators.length} validator${removedValidators.length === 1 ? '' : 's'})${colors.reset}`);
+		console.log(`  │  ─────────────────────────────────────────────────`);
+		console.log(`  │  = Available:         ${colors.cyan}${formatSOL(availableReserve).padStart(22)} SOL${colors.reset}`);
 	}
-	console.log();
-	console.log(`  Staked Total:      ${colors.yellow}${formatSOL(totalCurrent)} SOL${colors.reset}`);
-	console.log(`  Target Staked:     ${colors.green}${formatSOL(totalWithNew)} SOL${colors.reset}`);
-	if (state.newValidators.length > 0) {
-		console.log(
-			`  New validators:     ${colors.green}${formatSOL(newValidatorStake)} SOL${colors.reset}  ${colors.dim}(${state.newValidators.length} validator${state.newValidators.length === 1 ? '' : 's'})${colors.reset}`,
-		);
+	if (allocatedToNew > 0) {
+		console.log(`  │  − To New Validators: ${colors.yellow}${formatSOL(allocatedToNew).padStart(22)} SOL${colors.reset}  ${colors.dim}(${state.newValidators.length} validator${state.newValidators.length === 1 ? '' : 's'})${colors.reset}`);
+		console.log(`  │  ─────────────────────────────────────────────────`);
+		console.log(`  │  = Remaining:         ${remainingReserve >= 0 ? colors.green : colors.red}${formatSOL(remainingReserve).padStart(22)} SOL${colors.reset}`);
 	}
-	console.log(`  Pool Total:        ${colors.cyan}${formatSOL(totalPoolStake)} SOL${colors.reset}`);
+	console.log(colors.bold + '  └───────────────────────────────────────────────────────────────────────────────' + colors.reset);
 	console.log();
-	console.log(
-		`  Validators:        ${state.validators.filter((v) => v.action !== 'remove').length + state.newValidators.length} active, ${state.validators.filter((v) => v.action === 'remove').length} to remove`,
-	);
+
+	// ─── STAKING OVERVIEW ───────────────────────────────────────────────────────
+	console.log(colors.bold + '  ┌─ Staking Overview ───────────────────────────────────────────────────────────' + colors.reset);
+	console.log(`  │  Active Stake:        ${colors.yellow}${formatSOL(totalCurrent).padStart(22)} SOL${colors.reset}`);
+	if (totalTransient > 0) {
+		console.log(`  │  ⏳ Transient Stake:   ${colors.yellow}${formatSOL(totalTransient).padStart(22)} SOL${colors.reset}  ${colors.dim}(${validatorsWithTransient} validator${validatorsWithTransient === 1 ? '' : 's'}, next epoch)${colors.reset}`);
+	}
+	console.log(`  │  Target Stake:        ${colors.green}${formatSOL(totalWithNew).padStart(22)} SOL${colors.reset}`);
+	const stakeDiff = totalWithNew - totalCurrent;
+	if (stakeDiff !== 0) {
+		const diffColor = stakeDiff > 0 ? colors.green : colors.red;
+		const diffSign = stakeDiff > 0 ? '+' : '';
+		console.log(`  │  Change:              ${diffColor}${(diffSign + formatSOL(stakeDiff)).padStart(22)} SOL${colors.reset}`);
+	}
+	console.log(colors.bold + '  └───────────────────────────────────────────────────────────────────────────────' + colors.reset);
+	console.log();
+
+	// ─── POOL SUMMARY ───────────────────────────────────────────────────────────
+	console.log(colors.bold + '  ┌─ Pool Summary ────────────────────────────────────────────────────────────────' + colors.reset);
+	console.log(`  │  Pool Total:          ${colors.cyan}${formatSOL(totalPoolStake).padStart(22)} SOL${colors.reset}`);
+	const activeCount = state.validators.filter((v) => v.action !== 'remove').length + state.newValidators.length;
+	const removeCount = state.validators.filter((v) => v.action === 'remove').length;
+	const newCount = state.newValidators.length;
+	let validatorSummary = `${activeCount} active`;
+	if (removeCount > 0) validatorSummary += `, ${removeCount} removing`;
+	if (newCount > 0) validatorSummary += `, ${newCount} new`;
+	console.log(`  │  Validators:          ${validatorSummary.padStart(22)}`);
+	console.log(colors.bold + '  └───────────────────────────────────────────────────────────────────────────────' + colors.reset);
 	console.log();
 }
 
@@ -186,10 +214,10 @@ function printValidatorList(state: EditState) {
 
 	console.log(
 		colors.dim +
-			'  #    Name                   Vote Account       Current              Target             Action' +
+			'  #    Name                   Vote Account       Current              Target             Transient           Action' +
 			colors.reset,
 	);
-	console.log(colors.dim + '  ────────────────────────────────────────────────────────────────────────────────────────────────────────' + colors.reset);
+	console.log(colors.dim + '  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────' + colors.reset);
 
 	for (const v of allValidators) {
 		const actionColor =
@@ -213,8 +241,15 @@ function printValidatorList(state: EditState) {
 				? ` (${diffAmount >= 0 ? '+' : ''}${formatSOL(diffAmount)})`
 				: '';
 
+		// Show transient stake if any (pending activation next epoch)
+		const transient = v.transientBalance ?? 0;
+		const transientStr =
+			transient > 0
+				? `${colors.yellow}${formatSOL(transient).padStart(18)}${colors.reset}`
+				: colors.dim + '                 -' + colors.reset;
+
 		console.log(
-			`  ${String(v.index + 1).padStart(2)}   ${shortName(v.name, 20)}  ${shortAddress(v.voteAccount)}  ${formatSOL(v.activeBalance).padStart(18)}  ${formatSOL(v.targetBalance ?? v.activeBalance).padStart(18)}   ${actionColor}${actionText}${colors.reset}${diffStr}`,
+			`  ${String(v.index + 1).padStart(2)}   ${shortName(v.name, 20)}  ${shortAddress(v.voteAccount)}  ${formatSOL(v.activeBalance).padStart(18)}  ${formatSOL(v.targetBalance ?? v.activeBalance).padStart(18)}   ${transientStr}   ${actionColor}${actionText}${colors.reset}${diffStr}`,
 		);
 	}
 
@@ -234,6 +269,16 @@ function printValidatorList(state: EditState) {
 				`  New validators total: ${colors.green}${formatSOL(newTotal)} SOL${colors.reset} ${colors.dim}(${state.newValidators.length} validator${state.newValidators.length === 1 ? '' : 's'})${colors.reset}`,
 		);
 	}
+	// Show validators with transient stake
+	const withTransient = allValidators.filter((v) => (v.transientBalance ?? 0) > 0);
+	if (withTransient.length > 0) {
+		const totalTransient = withTransient.reduce((s, v) => s + (v.transientBalance ?? 0), 0);
+		console.log(
+			colors.yellow +
+				`  ⏳ ${withTransient.length} validator${withTransient.length === 1 ? '' : 's'} with pending stake: ${formatSOL(totalTransient)} SOL (activates next epoch)` +
+				colors.reset,
+		);
+	}
 }
 
 function printMenu() {
@@ -242,7 +287,8 @@ function printMenu() {
 	console.log('  [r #]     Remove validator by number (e.g., r 5)');
 	console.log('  [u #]     Undo remove (e.g., u 5)');
 	console.log('  [s # AMT] Set target stake to AMT (e.g., s 5 8000)');
-	console.log('  [+ # AMT] Add AMT to validator (target = current + AMT, e.g., + 4 26135)');
+	console.log('  [+ # AMT] Add AMT to validator (target = current + AMT, e.g., + 4 1000)');
+	console.log('  [- # AMT] Decrease AMT from validator (target = current - AMT, e.g., - 4 1000)');
 	console.log('  [a VOTE]  Add new validator');
 	console.log('  [b]       Auto-rebalance (redistribute from removed to lowest)');
 	console.log('  [v]       Validate totals');
@@ -372,9 +418,6 @@ function autoRebalance(state: EditState): EditState {
 
 function validate(state: EditState): boolean {
 	const totalCurrent = state.validators.reduce((s, v) => s + v.activeBalance, 0);
-	const removedStake = state.validators
-		.filter((v) => v.action === 'remove')
-		.reduce((s, v) => s + v.activeBalance, 0);
 	const totalTarget = state.validators
 		.filter((v) => v.action !== 'remove')
 		.reduce((s, v) => s + (v.targetBalance ?? v.activeBalance), 0);
@@ -383,29 +426,58 @@ function validate(state: EditState): boolean {
 		0,
 	);
 	const totalWithNew = totalTarget + newValidatorStake;
-	// Valid range: min = current minus removals (stake to reserve); max = current + reserve (can use reserve for new validators)
-	const minStaked = totalCurrent - removedStake;
-	const maxStaked = totalCurrent + state.reserveBalance;
-	const withinRange =
-		totalWithNew >= minStaked - 0.01 && totalWithNew <= maxStaked + 0.01;
 
-	if (withinRange) {
-		console.log(colors.green + '  ✓ Validation PASSED! Totals match.' + colors.reset);
-		return true;
-	} else {
-		const nearest = totalWithNew < minStaked ? minStaked : totalWithNew > maxStaked ? maxStaked : totalWithNew;
-		const diff = totalWithNew - nearest;
-		const rangeMsg =
-			diff > 0
-				? `target staked too high (max ${formatSOL(maxStaked)} SOL = current staked + reserve)`
-				: `target must be between ${formatSOL(minStaked)} and ${formatSOL(maxStaked)} SOL`;
+	// Calculate how much stake is being decreased (goes to reserve)
+	const decreasedStake = state.validators
+		.filter((v) => v.action !== 'remove')
+		.reduce((s, v) => {
+			const diff = v.activeBalance - (v.targetBalance ?? v.activeBalance);
+			return s + (diff > 0 ? diff : 0);
+		}, 0);
+
+	// Calculate how much stake is being removed (goes to reserve)
+	const removedStake = state.validators
+		.filter((v) => v.action === 'remove')
+		.reduce((s, v) => s + v.activeBalance, 0);
+
+	// Available reserve = current reserve + removed stake + decreased stake
+	const availableReserve = state.reserveBalance + removedStake + decreasedStake;
+
+	// min = can decrease to nearly 0 (minimum 1 SOL per active validator for rent)
+	const activeValidatorCount = state.validators.filter((v) => v.action !== 'remove').length + state.newValidators.length;
+	const minStaked = activeValidatorCount; // ~1 SOL minimum per validator
+	// max = current + reserve (can use all reserve for increases/new validators)
+	const maxStaked = totalCurrent + state.reserveBalance;
+
+	// Check if increases + new validators can be funded from available reserve
+	const increasedStake = state.validators
+		.filter((v) => v.action !== 'remove')
+		.reduce((s, v) => {
+			const diff = (v.targetBalance ?? v.activeBalance) - v.activeBalance;
+			return s + (diff > 0 ? diff : 0);
+		}, 0);
+	const totalNeeded = increasedStake + newValidatorStake;
+
+	if (totalNeeded > availableReserve + 0.01) {
 		console.log(
 			colors.red +
-				`  ✗ Validation FAILED! Difference: ${formatSOL(diff)} SOL (${rangeMsg})` +
+				`  ✗ Validation FAILED! Need ${formatSOL(totalNeeded)} SOL but only ${formatSOL(availableReserve)} SOL available (reserve + decreases + removals)` +
 				colors.reset,
 		);
 		return false;
 	}
+
+	if (totalWithNew < minStaked - 0.01) {
+		console.log(
+			colors.red +
+				`  ✗ Validation FAILED! Target staked ${formatSOL(totalWithNew)} SOL is below minimum ${formatSOL(minStaked)} SOL (1 SOL per validator)` +
+				colors.reset,
+		);
+		return false;
+	}
+
+	console.log(colors.green + '  ✓ Validation PASSED! Totals match.' + colors.reset);
+	return true;
 }
 
 function saveState(state: EditState) {
@@ -501,6 +573,19 @@ function generateBashScripts(state: EditState, output: any) {
 				voteAccount: add.voteAccount,
 				amount,
 				name: newV?.name,
+			});
+		}
+	}
+
+	// Collect all decrease operations (modifications with negative change)
+	const decreaseOps: Array<{ voteAccount: string; amount: number; name?: string }> = [];
+	for (const mod of output.modifications ?? []) {
+		if (mod.change < 0) {
+			const validator = state.validators.find((v) => v.voteAccount === mod.voteAccount);
+			decreaseOps.push({
+				voteAccount: mod.voteAccount,
+				amount: Math.abs(mod.change),
+				name: validator?.name,
 			});
 		}
 	}
@@ -656,6 +741,54 @@ function generateBashScripts(state: EditState, output: any) {
 		console.log(colors.dim + '  No increase operations needed' + colors.reset);
 	}
 
+	// Script 4: Decrease stake from validators (stake goes to reserve)
+	if (decreaseOps.length > 0) {
+		let script4 = '#!/bin/bash\n\n';
+		script4 += '# Script 4: Decrease stake from validators (stake returns to reserve)\n';
+		script4 += `# Generated: ${new Date().toISOString()}\n`;
+		script4 += `# Pool: ${POOL_ADDRESS}\n`;
+		script4 += `# Validators to decrease: ${decreaseOps.length}\n`;
+		script4 += '#\n';
+		script4 += '# Usage: bash 04_decrease_stake.sh /path/to/manager_keypair.json [rpc_url] [staker_keypair.json]\n';
+		script4 += '# If staker_keypair is omitted, manager keypair is used as staker.\n';
+		script4 += '# Note: Decreased stake goes to transient account, then merges to reserve next epoch.\n\n';
+		script4 += 'set -e\n\n';
+		script4 += 'KEYPAIR="$1"\n';
+		script4 += 'RPC_URL="${2:-https://api.mainnet-beta.solana.com}"\n';
+		script4 += 'STAKER_KEYPAIR="${3:-$KEYPAIR}"\n\n';
+		script4 += 'if [ -z "$KEYPAIR" ]; then\n';
+		script4 += '    echo "Usage: bash $0 /path/to/keypair.json [rpc_url] [staker_keypair.json]"\n';
+		script4 += '    exit 1\n';
+		script4 += 'fi\n\n';
+		script4 += 'echo "Using keypair (manager): $KEYPAIR"\n';
+		script4 += 'echo "Using RPC: $RPC_URL"\n';
+		script4 += 'echo "Using staker keypair: $STAKER_KEYPAIR"\n';
+		script4 += 'echo ""\n\n';
+
+		for (const op of decreaseOps) {
+			const nameComment = op.name ? op.name : 'Unknown';
+			const cleanAmount = toCleanSOL(op.amount);
+			script4 += `echo "Decreasing stake for: ${nameComment}"\n`;
+			script4 += `echo "Vote Account: ${op.voteAccount}"\n`;
+			script4 += `echo "Amount to decrease: ${cleanAmount} SOL"\n\n`;
+
+			script4 += `spl-stake-pool decrease-validator-stake ${POOL_ADDRESS} ${op.voteAccount} ${cleanAmount} \\\n`;
+			script4 += `    --url "$RPC_URL" \\\n`;
+			script4 += `    --manager "$KEYPAIR" \\\n`;
+			script4 += `    --fee-payer "$KEYPAIR" \\\n`;
+			script4 += `    --staker "$STAKER_KEYPAIR"\n\n`;
+
+			script4 += `echo "----------------------------------------"\n\n`;
+		}
+
+		const file4 = `${folderName}/04_decrease_stake.sh`;
+		fs.writeFileSync(file4, script4, 'utf8');
+		fs.chmodSync(file4, '755');
+		console.log(colors.green + `  ✓ Generated ${file4} (${decreaseOps.length} validators)` + colors.reset);
+	} else {
+		console.log(colors.dim + '  No decrease operations needed' + colors.reset);
+	}
+
 	console.log(colors.green + `  ✓ Scripts saved to ${folderName}/` + colors.reset);
 }
 
@@ -761,6 +894,45 @@ async function main() {
 				console.log(colors.red + '  Invalid validator number or amount' + colors.reset);
 				await prompt('  Press Enter to continue...');
 			}
+		} else if ((cmd === '-' || cmd === 'sub') && parts[1] && parts[2]) {
+			const idx = parseInt(parts[1], 10) - 1;
+			const subAmount = parseFloat(parts[2]);
+			const v = state.validators[idx];
+			if (v !== undefined && idx >= 0 && !isNaN(subAmount)) {
+				if (v.action === 'remove') {
+					console.log(colors.red + '  Cannot decrease a validator marked for removal. Undo with u # first.' + colors.reset);
+					await prompt('  Press Enter to continue...');
+				} else {
+					const current = v.targetBalance ?? v.activeBalance;
+					const newTarget = roundToLamports(current - subAmount);
+					if (newTarget < 0) {
+						console.log(colors.red + `  Cannot go below 0. Current target: ${formatSOL(current)} SOL` + colors.reset);
+						await prompt('  Press Enter to continue...');
+					} else {
+						v.targetBalance = newTarget;
+					}
+				}
+			} else if (
+				idx >= state.validators.length &&
+				idx < state.validators.length + state.newValidators.length &&
+				!isNaN(subAmount)
+			) {
+				const newIdx = idx - state.validators.length;
+				const nv = state.newValidators[newIdx];
+				if (nv !== undefined) {
+					const current = nv.targetBalance ?? 0;
+					const newTarget = roundToLamports(current - subAmount);
+					if (newTarget < 0) {
+						console.log(colors.red + `  Cannot go below 0. Current target: ${formatSOL(current)} SOL` + colors.reset);
+						await prompt('  Press Enter to continue...');
+					} else {
+						nv.targetBalance = newTarget;
+					}
+				}
+			} else {
+				console.log(colors.red + '  Invalid validator number or amount' + colors.reset);
+				await prompt('  Press Enter to continue...');
+			}
 		} else if (cmd === 'a' && parts[1]) {
 			const voteAccount = parts[1];
 			// Check if already exists
@@ -787,23 +959,28 @@ async function main() {
 					} else {
 						const resolvedNote =
 							toAdd !== voteAccount
-								? colors.dim + `  (resolved from validator identity to vote account ${shortAddress(toAdd)})` + colors.reset + '\n  '
+								? colors.dim + `  (resolved from validator identity to vote account ${shortAddress(toAdd)})` + colors.reset
 								: '';
+						// Fetch validator name
+						console.log(colors.dim + '  Fetching validator name...' + colors.reset);
+						const validatorName = await fetchValidatorName(toAdd);
 						state.newValidators.push({
 							voteAccount: toAdd,
-						stakeAccount: '',
-						activeBalance: 0,
-						activeBalanceLamports: '0',
-						transientStakeAccount: '',
-						transientBalance: 0,
-						transientBalanceLamports: '0',
-						targetBalance: 0,
-						action: 'add',
-					});
+							name: validatorName ?? undefined,
+							stakeAccount: '',
+							activeBalance: 0,
+							activeBalanceLamports: '0',
+							transientStakeAccount: '',
+							transientBalance: 0,
+							transientBalanceLamports: '0',
+							targetBalance: 0,
+							action: 'add',
+						});
+						const nameDisplay = validatorName ? colors.cyan + validatorName + colors.reset : 'Unknown';
 						console.log(
-							colors.green + '  Valid vote account. Added. Set stake with: s # AMOUNT' + colors.reset,
+							colors.green + `  ✓ Added: ${nameDisplay}. Set stake with: s # AMOUNT` + colors.reset,
 						);
-						if (resolvedNote) console.log(resolvedNote);
+						if (resolvedNote) console.log('  ' + resolvedNote);
 						await prompt('  Press Enter to continue...');
 					}
 				}

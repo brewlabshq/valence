@@ -42,7 +42,7 @@ interface RugAlertMeta {
 	};
 }
 
-async function fetchValidatorName(voteAccount: string): Promise<string | null> {
+export async function fetchValidatorName(voteAccount: string): Promise<string | null> {
 	try {
 		const response = await fetch(`${RUGALERT_API_BASE}/${voteAccount}`);
 		if (!response.ok) {
