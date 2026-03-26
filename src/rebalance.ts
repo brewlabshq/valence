@@ -106,10 +106,26 @@ function printHeader(state: EditState) {
 	const totalTransient = state.validators.reduce((s, v) => s + (v.transientBalance ?? 0), 0);
 	const validatorsWithTransient = state.validators.filter((v) => (v.transientBalance ?? 0) > 0).length;
 
-	// Reserve calculations
-	const availableReserve = state.reserveBalance + removedStake;
+	// Calculate stake increases and decreases on existing validators
+	const increasedStake = state.validators
+		.filter((v) => v.action !== 'remove')
+		.reduce((s, v) => {
+			const diff = (v.targetBalance ?? v.activeBalance) - v.activeBalance;
+			return s + (diff > 0 ? diff : 0);
+		}, 0);
+	const decreasedStake = state.validators
+		.filter((v) => v.action !== 'remove')
+		.reduce((s, v) => {
+			const diff = v.activeBalance - (v.targetBalance ?? v.activeBalance);
+			return s + (diff > 0 ? diff : 0);
+		}, 0);
+
+	// Reserve calculations (only current reserve is available now;
+	// decreases/removals return to reserve next epoch via transient)
 	const allocatedToNew = newValidatorStake;
-	const remainingReserve = availableReserve - allocatedToNew;
+	const totalAllocated = allocatedToNew + increasedStake;
+	const remainingReserve = state.reserveBalance - totalAllocated;
+	const returningNextEpoch = removedStake + decreasedStake;
 
 	const totalPoolStake = totalCurrent + state.reserveBalance + totalTransient;
 
@@ -121,15 +137,26 @@ function printHeader(state: EditState) {
 	// ─── RESERVE & LIQUIDITY ────────────────────────────────────────────────────
 	console.log(colors.bold + '  ┌─ Reserve & Liquidity ────────────────────────────────────────────────────────' + colors.reset);
 	console.log(`  │  Current Reserve:     ${colors.blue}${formatSOL(state.reserveBalance).padStart(22)} SOL${colors.reset}`);
-	if (removedStake > 0) {
-		console.log(`  │  + From Removals:     ${colors.green}${formatSOL(removedStake).padStart(22)} SOL${colors.reset}  ${colors.dim}(${removedValidators.length} validator${removedValidators.length === 1 ? '' : 's'})${colors.reset}`);
-		console.log(`  │  ─────────────────────────────────────────────────`);
-		console.log(`  │  = Available:         ${colors.cyan}${formatSOL(availableReserve).padStart(22)} SOL${colors.reset}`);
-	}
-	if (allocatedToNew > 0) {
-		console.log(`  │  − To New Validators: ${colors.yellow}${formatSOL(allocatedToNew).padStart(22)} SOL${colors.reset}  ${colors.dim}(${state.newValidators.length} validator${state.newValidators.length === 1 ? '' : 's'})${colors.reset}`);
+	if (increasedStake > 0 || allocatedToNew > 0) {
+		if (increasedStake > 0) {
+			const modifiedCount = state.validators.filter((v) => v.action !== 'remove' && (v.targetBalance ?? v.activeBalance) > v.activeBalance).length;
+			console.log(`  │  − Stake Increases:   ${colors.yellow}${formatSOL(increasedStake).padStart(22)} SOL${colors.reset}  ${colors.dim}(${modifiedCount} validator${modifiedCount === 1 ? '' : 's'})${colors.reset}`);
+		}
+		if (allocatedToNew > 0) {
+			console.log(`  │  − To New Validators: ${colors.yellow}${formatSOL(allocatedToNew).padStart(22)} SOL${colors.reset}  ${colors.dim}(${state.newValidators.length} validator${state.newValidators.length === 1 ? '' : 's'})${colors.reset}`);
+		}
 		console.log(`  │  ─────────────────────────────────────────────────`);
 		console.log(`  │  = Remaining:         ${remainingReserve >= 0 ? colors.green : colors.red}${formatSOL(remainingReserve).padStart(22)} SOL${colors.reset}`);
+	}
+	if (returningNextEpoch > 0) {
+		console.log(`  │`);
+		if (decreasedStake > 0) {
+			const decreasedCount = state.validators.filter((v) => v.action !== 'remove' && (v.targetBalance ?? v.activeBalance) < v.activeBalance).length;
+			console.log(`  │  ${colors.dim}⏳ +${formatSOL(decreasedStake)} SOL returning next epoch (${decreasedCount} decrease${decreasedCount === 1 ? '' : 's'})${colors.reset}`);
+		}
+		if (removedStake > 0) {
+			console.log(`  │  ${colors.dim}⏳ +${formatSOL(removedStake)} SOL returning next epoch (${removedValidators.length} removal${removedValidators.length === 1 ? '' : 's'})${colors.reset}`);
+		}
 	}
 	console.log(colors.bold + '  └───────────────────────────────────────────────────────────────────────────────' + colors.reset);
 	console.log();
@@ -427,29 +454,7 @@ function validate(state: EditState): boolean {
 	);
 	const totalWithNew = totalTarget + newValidatorStake;
 
-	// Calculate how much stake is being decreased (goes to reserve)
-	const decreasedStake = state.validators
-		.filter((v) => v.action !== 'remove')
-		.reduce((s, v) => {
-			const diff = v.activeBalance - (v.targetBalance ?? v.activeBalance);
-			return s + (diff > 0 ? diff : 0);
-		}, 0);
-
-	// Calculate how much stake is being removed (goes to reserve)
-	const removedStake = state.validators
-		.filter((v) => v.action === 'remove')
-		.reduce((s, v) => s + v.activeBalance, 0);
-
-	// Available reserve = current reserve + removed stake + decreased stake
-	const availableReserve = state.reserveBalance + removedStake + decreasedStake;
-
-	// min = can decrease to nearly 0 (minimum 1 SOL per active validator for rent)
-	const activeValidatorCount = state.validators.filter((v) => v.action !== 'remove').length + state.newValidators.length;
-	const minStaked = activeValidatorCount; // ~1 SOL minimum per validator
-	// max = current + reserve (can use all reserve for increases/new validators)
-	const maxStaked = totalCurrent + state.reserveBalance;
-
-	// Check if increases + new validators can be funded from available reserve
+	// Only current reserve is available now; decreases/removals return next epoch
 	const increasedStake = state.validators
 		.filter((v) => v.action !== 'remove')
 		.reduce((s, v) => {
@@ -458,10 +463,14 @@ function validate(state: EditState): boolean {
 		}, 0);
 	const totalNeeded = increasedStake + newValidatorStake;
 
-	if (totalNeeded > availableReserve + 0.01) {
+	// min = can decrease to nearly 0 (minimum 1 SOL per active validator for rent)
+	const activeValidatorCount = state.validators.filter((v) => v.action !== 'remove').length + state.newValidators.length;
+	const minStaked = activeValidatorCount; // ~1 SOL minimum per validator
+
+	if (totalNeeded > state.reserveBalance + 0.01) {
 		console.log(
 			colors.red +
-				`  ✗ Validation FAILED! Need ${formatSOL(totalNeeded)} SOL but only ${formatSOL(availableReserve)} SOL available (reserve + decreases + removals)` +
+				`  ✗ Validation FAILED! Need ${formatSOL(totalNeeded)} SOL but only ${formatSOL(state.reserveBalance)} SOL available in reserve` +
 				colors.reset,
 		);
 		return false;
